@@ -1,0 +1,81 @@
+import imaplib
+import email
+import re
+import time
+from datetime import datetime
+from bs4 import BeautifulSoup
+
+EMAIL = "automaticbotadress@gmail.com"
+APP_PASSWORD = "iodw qair xqlx sajj"
+
+def log(message):
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    print(f"{timestamp} {message}")
+
+def extract_text_from_html(html):
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.get_text()
+
+def check_email_for_alerts():
+    alerts = []  # hier sammeln wir die erkannten Aktionen
+    try:
+        log("🔄 Verbinde zu Gmail...")
+        imap = imaplib.IMAP4_SSL("imap.gmail.com")
+        imap.login(EMAIL, APP_PASSWORD)
+        imap.select("inbox")
+
+        log("📥 Suche nach ungelesenen E-Mails...")
+        status, messages = imap.search(None, 'UNSEEN')
+
+        if status != "OK":
+            log("⚠️ Keine E-Mails gefunden oder Fehler beim Abruf.")
+            return alerts
+
+        email_ids = messages[0].split()
+
+        if not email_ids:
+            log("📭 Keine neuen Mails.")
+            return alerts
+
+        log(f"📬 {len(email_ids)} neue Mail(s) gefunden.")
+
+        for mail_id in email_ids:
+            status, msg_data = imap.fetch(mail_id, "(RFC822)")
+            if status != "OK":
+                log(f"⚠️ Fehler beim Abrufen der Mail-ID {mail_id}")
+                continue
+
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+
+            subject = msg["Subject"]
+            from_ = msg["From"]
+            log(f"✉️ Mail von: {from_}, Betreff: {subject}")
+
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                if content_type in ["text/plain", "text/html"]:
+                    try:
+                        body = part.get_payload(decode=True).decode()
+                        if content_type == "text/html":
+                            body = extract_text_from_html(body)
+
+                        match = re.search(r'{"action":\s*"(LONG|SHORT)"}', body)
+                        if match:
+                            action = match.group(1).upper()
+                            log(f"✅ Neuer Alert erkannt: {action}")
+                            alerts.append(action)
+                            break
+                    except Exception as decode_err:
+                        log(f"❗ Fehler beim Parsen: {decode_err}")
+
+        imap.logout()
+        return alerts
+
+    except Exception as e:
+        log(f"❗ Fehler beim E-Mail-Check: {e}")
+        return alerts
+if __name__ == "__main__":
+    while True:
+        check_email_for_alerts()
+        time.sleep(5)
