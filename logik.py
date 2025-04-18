@@ -1,96 +1,71 @@
-import uuid
-import requests
-from decimal import Decimal, ROUND_DOWN, getcontext
-from balance import get_usdt_balance
-from trade import place_order
-from data import fetch_bitget_klines, calculate_vwap_last_60
+import logging
+from decimal import Decimal
+from config import symbol  # Symbol aus config.py (z. B. "BTCUSDT")
+from balance import get_usdt_balance  # Funktion aus balance.py
+from trade import place_market_order, client  # Funktion und Client aus trade.py
 
-# Setze globale Genauigkeit für Decimal
-getcontext().prec = 10
+# Logging-Konfiguration
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 
-# === Position Tracking (max. 3 Trades pro Richtung) ===
-long_trade_count = 0
-short_trade_count = 0
-MAX_TRADES_PER_DIRECTION = 3
+def get_open_positions_count(symbol, direction):
+    """
+    Prüft die Anzahl offener Positionen für die angegebene Richtung (LONG oder SHORT).
+    
+    Args:
+        symbol (str): Handelspaar, z.B. "BTCUSDT".
+        direction (str): "LONG" oder "SHORT".
+    
+    Returns:
+        int: Anzahl offener Positionen für die Richtung.
+    """
+    try:
+        positions = client.fetch_positions([symbol], params={'productType': 'USDT-FUTURES'})
+        count = 0
+        side = 'long' if direction == 'LONG' else 'short'
+        for position in positions:
+            if position['side'] == side and float(position['contracts']) > 0:
+                count += 1
+        logging.info(f"Anzahl offener {direction}-Positionen für {symbol}: {count}")
+        return count
+    except Exception as e:
+        logging.error(f"Fehler beim Abrufen offener Positionen: {e}")
+        raise
 
-def get_market_price(symbol):
-    url = f"https://api.bitget.com/api/mix/v1/market/ticker?symbol={symbol}"
-    res = requests.get(url).json()
-    return Decimal(res["data"]["last"])
+def execute_trade(direction):
+    """
+    Führt einen Trade (LONG oder SHORT) aus, wenn weniger als 3 Positionen offen sind.
+    Nutzt 1% des USDT-Saldos aus balance.py.
+    """
+    try:
+        logging.info(f"Starte Trade-Ausführung: {direction}")
+        
+        # Prüfen, ob maximale Anzahl an Positionen pro Seite erreicht ist
+        open_positions = get_open_positions_count(symbol, direction)
+        if open_positions >= 3:
+            logging.warning(f"Maximal 3 {direction}-Positionen erlaubt. Trade wird übersprungen.")
+            return
 
-def calculate_sl_and_vwap_tp(entry_price: Decimal, direction: str):
-    sl_distance = Decimal("0.006")  # 0.6 %
+        # USDT-Saldo aus balance.py abrufen
+        available_usdt = get_usdt_balance()
+        logging.info(f"Verfügbares USDT: {available_usdt}")
 
-    # 📊 Daten holen & VWAP berechnen
-    df = fetch_bitget_klines(symbol="BTCUSDT", granularity="1m", num_candles=60)
-    if df is None:
-        raise Exception("Fehler beim Abrufen der Candles für VWAP")
+        # 1% des Kapitals berechnen
+        usdt_amount = available_usdt * Decimal('0.01')
+        logging.info(f"Trade-Menge: {usdt_amount} USDT (1% des Kapitals)")
 
-    vwap_tp = Decimal(str(calculate_vwap_last_60(df)))
+        # Prüfen, ob genügend USDT verfügbar ist
+        if usdt_amount <= 0:
+            logging.error("USDT-Menge ist 0 oder negativ.")
+            raise ValueError("Ungültige USDT-Menge für den Trade")
 
-    # 🔻 SL auf Basis von Prozent
-    if direction == "LONG":
-        stop_loss = entry_price * (Decimal("1") - sl_distance)
-    else:
-        stop_loss = entry_price * (Decimal("1") + sl_distance)
+        # Seite bestimmen (buy für LONG, sell für SHORT)
+        side = 'buy' if direction == 'LONG' else 'sell'
 
-    stop_loss = stop_loss.quantize(Decimal("0.01"))
-    vwap_tp = vwap_tp.quantize(Decimal("0.01"))
+        # Marktorder über trade.py platzieren
+        logging.info(f"Platzieren einer {direction}-Marktorder für {usdt_amount} USDT")
+        order = place_market_order(symbol, side, usdt_amount)
+        logging.info(f"Order platziert: {order}")
 
-    return stop_loss, vwap_tp
-
-def execute_trade(direction: str, symbol="BTCUSDT"):
-    global long_trade_count, short_trade_count
-
-    # Prüfen auf aktives Limit
-    if direction == "LONG" and long_trade_count >= MAX_TRADES_PER_DIRECTION:
-        print("⚠️ Max. 3 LONG-Positionen erreicht – kein neuer Trade.")
-        return None
-    if direction == "SHORT" and short_trade_count >= MAX_TRADES_PER_DIRECTION:
-        print("⚠️ Max. 3 SHORT-Positionen erreicht – kein neuer Trade.")
-        return None
-
-    usdt_balance = get_usdt_balance()
-    if usdt_balance is None:
-        print("❗ Kein USDT-Guthaben verfügbar – Trade wird abgebrochen.")
-        return
-
-    capital_to_use = usdt_balance * Decimal("0.01")
-    leverage = Decimal("100")
-    order_value = capital_to_use * leverage
-
-    current_price = get_market_price(symbol)
-    size = (order_value / current_price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
-
-    stop_loss, vwap_tp = calculate_sl_and_vwap_tp(current_price, direction)
-
-    side = "buy" if direction == "LONG" else "sell"
-    client_oid = str(uuid.uuid4())
-
-    print(f"\n📢 Executing {direction} | Size: {size} | SL: {stop_loss} | TP (VWAP): {vwap_tp} | Entry: {current_price}")
-
-    place_order(
-        symbol=symbol,
-        product_type="USDT-FUTURES",
-        margin_mode="isolated",
-        margin_coin="USDT",
-        size=str(size),
-        side=side,
-        order_type="market",
-        client_oid=client_oid,
-        preset_sl=str(stop_loss),
-        preset_tp=str(vwap_tp),
-    )
-
-    # Zähler hochsetzen
-    if direction == "LONG":
-        long_trade_count += 1
-    elif direction == "SHORT":
-        short_trade_count += 1
-
-    return client_oid
-
-def reset_trade_counts():
-    global long_trade_count, short_trade_count
-    long_trade_count = 0
-    short_trade_count = 0
+    except Exception as e:
+        logging.error(f"Fehler bei der Trade-Ausführung: {e}")
+        raise
